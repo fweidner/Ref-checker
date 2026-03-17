@@ -2,7 +2,7 @@
 """
 check_refs.py -- Extract and verify references from a research paper PDF.
 
-Optimised for IEEE-style bracket references:
+Optimised for IEEE-style and abbrv-doi BibTeX bracket references:
   [N] Authors. Title. Venue, Year. doi: 10.xxx/yyy
 
 Extraction: uses pdftotext -raw (poppler-utils) for clean word spacing.
@@ -11,11 +11,14 @@ Falls back to pdfplumber if pdftotext is not available.
 Lookup order:
   1. Semantic Scholar DOI lookup  (deterministic, most reliable)
   2. Semantic Scholar title search (fallback for refs without DOI)
-  3. Google Scholar via `scholarly` (last resort; gets rate-limited fast)
+  3. CrossRef title search         (last resort)
+  4. Google Scholar via scholarly  (final fallback; skipped once blocked)
 
 Usage:
   python check_refs.py paper.pdf
   python check_refs.py paper.pdf --output results.csv --delay 3
+
+Developed with the assistance of Claude (Anthropic) via Claude Code.
 """
 
 import sys
@@ -161,8 +164,18 @@ def parse_references(ref_section: str) -> list[dict]:
             last_num = num
             current = {"number": num, "raw": line[m.end():]}
         elif current:
-            # Continuation line
-            current["raw"] += " " + line
+            # Continuation line — rejoin soft hyphens from PDF line breaks.
+            # When a word is hyphenated at a line break the raw ends with '-'
+            # and the next line starts with the rest of the word.
+            # e.g. "di-" + "rect volume" → "direct volume"
+            #      "Self-" + "Supervised" → "Self-Supervised"
+            # Heuristic: always strip the trailing hyphen and join without
+            # space; real compound hyphens are preserved inside the word.
+            prev = current["raw"]
+            if prev.endswith('-') and line and line[0].isalpha():
+                current["raw"] = prev[:-1] + line
+            else:
+                current["raw"] += " " + line
 
     if current:
         refs.append(current)
@@ -207,34 +220,98 @@ def extract_doi(raw: str) -> str | None:
     return doi
 
 
+VENUE_PATTERNS = re.compile(
+    r'\b(vol\.|pp\.|no\.|ed\.|Trans\.|Proc\.|Conf\.|Lett\.|Int\.|Symp\.|arXiv)\b'
+    r'|^In\b',
+    re.IGNORECASE,
+)
+
+
 def extract_title(raw: str) -> str:
     """
-    Extract title from an IEEE-style reference.
+    Extract title from a reference formatted by IEEE or abbrv-doi BibTeX styles.
 
-    Format: Authors. Title. Venue, Year. doi: ...
+    Both styles use period-separated blocks:
+      Authors. Title. Venue, Year. doi: ...
 
-    Author initials (single uppercase letter + '.') are the discriminating
-    feature: we split on '. ' and return the first segment with 4+ words
-    and fewer than 2 initials.
+    abbrv specifics that require special handling:
+      - Abbreviated first names (F.~Smith) create extra '. ' split points
+      - This yields author-fragment segments like "Jones, and G" (3 words,
+        0 initials, uppercase-starting) that must be filtered
+      - Titles may be shorter than 4 words (sentence-case, no quotes)
+      - Venue blocks contain abbreviations like "IEEE Trans." or start with "In"
     """
     # Strip doi and everything after
     clean = re.sub(r'\bdoi:\s*\S.*$', '', raw, flags=re.IGNORECASE).strip()
-    # Strip trailing lone page-reference tokens: " 5" or " 4, 5"
-    clean = re.sub(r'[\s,]+\d{1,3}\.?\s*$', '', clean).strip()
+    # Strip trailing stray numbers: " 5", ", 5" or ". 5" (PDF citation artefacts)
+    # Use \d{1,2} to avoid stripping legitimate 4-digit years
+    clean = re.sub(r'(?:[\s,]|\.)\s*\d{1,2}\s*$', '', clean).strip()
     # Strip URLs
     clean = re.sub(r'https?://\S+', '', clean).strip()
 
+    _MONTHS = (r'Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?'
+               r'|July?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?'
+               r'|Nov(?:ember)?|Dec(?:ember)?')
+
     for seg in re.split(r'\.\s+', clean):
         words = seg.split()
+        if len(words) < 3:
+            continue
+        if not seg[0:1].isupper():
+            continue
+        # Skip author-list fragments:
+        #   >= 2 abbreviated initials (e.g. "F. Smith, G. Jones")
         initials = sum(1 for w in words if re.match(r'^[A-Z]\.$', w))
-        if len(words) >= 4 and initials < 2 and seg[0:1].isupper():
-            return seg.strip()
+        if initials >= 2:
+            continue
+        #   ends with a bare capital — cut-off first initial of next author
+        #   e.g. "Jones, and G" or "Smith and B"
+        if re.search(r'\s[A-Z]$', seg):
+            continue
+        # Skip venue/metadata segments
+        if VENUE_PATTERNS.search(seg):
+            continue
+        # Strip trailing date that isn't a separate block: ", January 2003" or ", 2003"
+        seg = re.sub(rf',\s+(?:{_MONTHS})\.?\s+\d{{4}}\s*$', '', seg, flags=re.IGNORECASE).strip()
+        seg = re.sub(r',\s+\d{4}\s*$', '', seg).strip()
+        return seg
 
     return clean[:180]
 
 
 def build_query(raw: str) -> str:
     return extract_title(raw)[:200]
+
+
+# ---------------------------------------------------------------------------
+# 4b. refextract parsing (primary structured field extraction)
+# ---------------------------------------------------------------------------
+
+def refextract_parse(raw: str) -> dict:
+    """
+    Parse a raw reference string with refextract.
+
+    Returns a dict with keys: doi, title, authors, year — all may be None.
+    Returns an empty dict if refextract is not installed or parsing fails,
+    so callers can always fall back to the regex-based helpers.
+    """
+    try:
+        from refextract import extract_references_from_string
+    except ImportError:
+        return {}
+    try:
+        results = extract_references_from_string(raw)
+        if not results:
+            return {}
+        rec = results[0]
+        doi    = (rec.get("doi")    or [None])[0] or None
+        titles = rec.get("title", [])
+        title  = (titles[0].get("title") if titles else None) or None
+        authors = rec.get("author") or None
+        year   = (rec.get("year")   or [None])[0] or None
+        return {"doi": doi, "title": title, "authors": authors, "year": year}
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -292,11 +369,23 @@ CR_SEARCH = "https://api.crossref.org/works"
 CR_HEADERS = {"User-Agent": "ref-checker/1.0 (mailto:user@example.com)"}
 
 
-def check_crossref(query: str) -> tuple[bool | None, str]:
+def check_crossref(query: str, authors: list | None = None, year: str | None = None) -> tuple[bool | None, str]:
+    # Build the richest query possible from available metadata
+    if authors or year:
+        bib_parts = [query]
+        if authors:
+            bib_parts.append(", ".join(authors[:3]))
+        if year:
+            bib_parts.append(year)
+        params = {"query.bibliographic": " ".join(bib_parts), "rows": 1,
+                  "select": "title,author,published,score"}
+    else:
+        params = {"query.title": query, "rows": 1,
+                  "select": "title,author,published,score"}
     try:
         r = requests.get(
             CR_SEARCH,
-            params={"query.title": query, "rows": 1, "select": "title,author,published,score"},
+            params=params,
             headers=CR_HEADERS,
             timeout=12,
         )
@@ -321,6 +410,58 @@ def check_crossref(query: str) -> tuple[bool | None, str]:
 
 
 # ---------------------------------------------------------------------------
+# 6b. Google Scholar (final last-resort fallback)
+# ---------------------------------------------------------------------------
+
+def check_google_scholar(query: str, timeout: float = 15.0) -> tuple[bool | None, str]:
+    """
+    Query Google Scholar via the `scholarly` library.
+
+    Rate-limiting / blocking safeguards:
+      - Entire call (generator creation + first result) runs in a worker
+        thread so the timeout can fire even if scholarly hangs internally.
+      - Any response that looks like a block (HTTP 429, captcha, timeout)
+        returns a detail string containing "blocked" so the caller can set
+        gs_blocked=True and skip all further GS calls for this run.
+    """
+    try:
+        from scholarly import scholarly as _scholarly
+    except ImportError:
+        return None, "GS: scholarly not installed"
+    import threading
+
+    result_box = [None]   # [value] or [StopIteration] or [Exception]
+
+    def _run():
+        try:
+            result_box[0] = next(_scholarly.search_pubs(query))
+        except StopIteration:
+            result_box[0] = StopIteration
+        except Exception as e:
+            result_box[0] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        # Thread still blocked (GS hanging) — abandon it and move on
+        return None, "GS: blocked (timeout — likely rate-limited)"
+
+    val = result_box[0]
+    if val is StopIteration:
+        return False, "GS: no results"
+    if isinstance(val, Exception):
+        msg = str(val)
+        is_blocked = any(w in msg.lower() for w in ("blocked", "captcha", "429", "too many"))
+        return None, f"GS: {'blocked' if is_blocked else 'error'} ({msg[:80]})"
+    if val is None:
+        return None, "GS: no response"
+    title = val.get("bib", {}).get("title", "?")
+    return True, f"GS: {title[:80]}"
+
+
+# ---------------------------------------------------------------------------
 # 7.  Orchestration
 # ---------------------------------------------------------------------------
 
@@ -329,8 +470,10 @@ STATUS_LABELS  = {True: "FOUND", False: "NOT FOUND", None: "UNKNOWN"}
 
 
 def check_reference(ref: dict, gs_blocked: bool) -> tuple[dict, bool]:
-    doi   = extract_doi(ref["raw"])
-    query = build_query(ref["raw"])
+    rx    = refextract_parse(ref["raw"])
+    doi   = rx.get("doi")   or extract_doi(ref["raw"])
+    query = rx.get("title") or build_query(ref["raw"])
+    query = query[:200]
 
     result = {
         "number": ref["number"],
@@ -363,7 +506,7 @@ def check_reference(ref: dict, gs_blocked: bool) -> tuple[dict, bool]:
 
     # 3. CrossRef
     if query:
-        found, detail = check_crossref(query)
+        found, detail = check_crossref(query, authors=rx.get("authors"), year=rx.get("year"))
         if found is True:
             result.update(found=True, source="CR", detail=detail)
             return result, gs_blocked
@@ -371,6 +514,23 @@ def check_reference(ref: dict, gs_blocked: bool) -> tuple[dict, bool]:
             result.update(
                 found=found,
                 source="CR" if found is not None else "",
+                detail=detail,
+            )
+
+    # 4. Google Scholar — whenever not yet positively confirmed; skip once blocked
+    if query and result["found"] is not True and not gs_blocked:
+        found, detail = check_google_scholar(query)
+        if "blocked" in detail.lower():
+            gs_blocked = True
+            print("[warn] Google Scholar blocked — skipping GS for remaining references.",
+                  file=sys.stderr)
+        if found is True:
+            result.update(found=True, source="GS", detail=detail)
+            return result, gs_blocked
+        if result["found"] is None:
+            result.update(
+                found=found,
+                source="GS" if found is not None else "",
                 detail=detail,
             )
 
