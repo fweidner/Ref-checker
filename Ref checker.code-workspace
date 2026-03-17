@@ -1,0 +1,22 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {},
+	"launch": {
+		"version": "0.2.0",
+		"configurations": [
+			{
+				"name": "Run check_refs with test.pdf",
+				"type": "debugpy",
+				"request": "launch",
+				"program": "${workspaceFolder}/check_refs.py",
+				"args": ["test2.pdf", "-v"],
+				"console": "integratedTerminal",
+				"cwd": "${workspaceFolder}"
+			}
+		]
+	}
+}
